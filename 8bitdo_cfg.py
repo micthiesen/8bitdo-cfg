@@ -11,6 +11,7 @@ import os
 import select
 import struct
 import sys
+import time
 
 CONFIG_SIZE = 1652
 CHUNK = 45
@@ -95,12 +96,19 @@ def request(req_type, sub, data_len, offset, payload=b""):
     zero there (as an earlier version of this tool did) makes the firmware
     silently discard the config.
     """
+    if len(payload) > CHUNK:
+        # bytearray slice assignment would silently grow pkt past 64 bytes and
+        # corrupt the report framing rather than failing.
+        raise ValueError(f"payload {len(payload)} exceeds {CHUNK}-byte chunk")
     pkt = bytearray(PKT)
     pkt[0] = 0x81
     pkt[1] = data_len + 17
     pkt[2] = 0x04
     struct.pack_into("<HH", pkt, 3, req_type, sub)
     struct.pack_into("<H", pkt, 7, data_len)
+    # Empty payloads send 0, not crc16_kermit(b"") == 0xFFFF. That matches the
+    # reference implementation (s8n/ultimatecontroller-rs, build_transfer_packet)
+    # and the pcap of the official app; do not "correct" it to 0xFFFF.
     struct.pack_into("<H", pkt, 9, crc16_kermit(payload) if payload else 0)
     struct.pack_into("<I", pkt, 11, CONFIG_SIZE if req_type not in (REQ_COMMIT, REQ_REPORT_STATE) else 0)
     struct.pack_into("<I", pkt, 15, offset)
@@ -126,8 +134,6 @@ def exchange(fd, pkt, want_type, timeout=3.0):
     hidraw node, so responses must be filtered by their 02 04 04 00 header.
     """
     os.write(fd, pkt)
-    deadline = select.select
-    import time
     end = time.time() + timeout
     while time.time() < end:
         r, _, _ = select.select([fd], [], [], max(0.05, end - time.time()))
@@ -261,15 +267,29 @@ def diff(a, b):
     print(f"{total} bytes changed")
 
 
+USAGE = """usage: 8bitdo_cfg.py read  <hidraw> <outfile>
+       8bitdo_cfg.py dump  <file>
+       8bitdo_cfg.py patch <infile> <outfile> [--all-profiles] [--slot N]
+                                              [--mode N] [--test-ab]
+       8bitdo_cfg.py write <hidraw> <infile>"""
+
+# command -> number of positional arguments it requires after the command name
+ARGC = {"read": 2, "dump": 1, "patch": 2, "write": 2}
+
+
 def main():
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         print(__doc__)
-        print("usage: 8bitdo_cfg.py read  <hidraw> <outfile>")
-        print("       8bitdo_cfg.py dump  <file>")
-        print("       8bitdo_cfg.py patch <infile> <outfile>")
-        print("       8bitdo_cfg.py write <hidraw> <infile>")
+        print(USAGE)
         return 1
     cmd = sys.argv[1]
+    need = ARGC.get(cmd)
+    if need is None:
+        print(f"unknown command: {cmd}\n{USAGE}")
+        return 1
+    if len(sys.argv) - 2 < need:
+        print(f"{cmd} needs {need} argument(s)\n{USAGE}")
+        return 1
     if cmd == "read":
         cfg = read_config(sys.argv[2])
         with open(sys.argv[3], "wb") as f:
@@ -306,9 +326,6 @@ def main():
             cfg = f.read()
         write_config(sys.argv[2], cfg)
         print("write + commit complete")
-    else:
-        print(f"unknown command: {cmd}")
-        return 1
     return 0
 
 

@@ -22,16 +22,17 @@ every input registering twice.
 """
 
 import errno
-import fcntl
 import glob
 import os
 import select
+import signal
 import struct
 import sys
 import time
 
 import evdev
 from evdev import AbsInfo, InputDevice, UInput, ecodes as e
+from evdev.uinput import UInputError
 
 SRC_VENDOR = 0x2DC8
 SRC_PRODUCT = 0x3013  # Ultimate 2.4G, D-input mode
@@ -84,34 +85,9 @@ CAPS = {
               e.FF_SINE, e.FF_GAIN],
 }
 
-# ---- uinput force-feedback ioctls (not exposed by python-evdev) ----
-# struct ff_effect is 48 bytes on x86_64; uinput_ff_upload is
-# request_id(4) + retval(4) + effect(48) + old(48) = 104 bytes.
-SIZEOF_FF_EFFECT = 48
-SIZEOF_FF_UPLOAD = 104
-SIZEOF_FF_ERASE = 12
-UINPUT_IOCTL_BASE = ord('U')
-
-
-def _iowr(nr, size):
-    return (3 << 30) | (size << 16) | (UINPUT_IOCTL_BASE << 8) | nr
-
-
-def _iow(nr, size):
-    return (1 << 30) | (size << 16) | (UINPUT_IOCTL_BASE << 8) | nr
-
-
-UI_BEGIN_FF_UPLOAD = _iowr(200, SIZEOF_FF_UPLOAD)
-UI_END_FF_UPLOAD = _iow(201, SIZEOF_FF_UPLOAD)
-UI_BEGIN_FF_ERASE = _iowr(202, SIZEOF_FF_ERASE)
-UI_END_FF_ERASE = _iow(203, SIZEOF_FF_ERASE)
-
-EV_SIZE = struct.calcsize("llHHi")   # struct input_event on 64-bit
-
 VIBRATE_MAX_MS = 0xFFFF  # duration field is uint16 ms
 HOLD_MS = 1000           # chunk length used for open-ended effects
 REFRESH_S = 0.75         # re-arm an open-ended effect before HOLD_MS expires
-IDLE_TIMEOUT = 0.2       # select timeout when no effect is playing
 
 
 def log(msg):
@@ -164,14 +140,21 @@ class Rumble:
     def close(self):
         if self.fd is not None:
             try:
-                self._send(0, 0)
-            except Exception:
-                pass
+                self._send(0, 0, 0)
+            except OSError as exc:
+                log(f"rumble: stop on close failed: {exc}")
             try:
                 os.close(self.fd)
             except OSError:
                 pass
             self.fd = None
+        # Reset scheduling state too. Leaving `until`/`next_refresh` set would
+        # keep deadline() short forever (waking the loop while the device is
+        # gone) and would replay the stale motor values on reconnect.
+        self.until = 0.0
+        self.next_refresh = float("inf")
+        self.left = self.right = 0
+        self.gain = 1.0
 
     def _send(self, left, right, duration_ms=HOLD_MS):
         if self.fd is None:
@@ -221,9 +204,13 @@ class Rumble:
         self._send(0, 0, 0)
 
     def deadline(self):
-        """Seconds until this needs attention, for the select() timeout."""
+        """select() timeout, or None to block until an fd is readable.
+
+        Nothing needs doing on a timer while no effect is playing, so idling
+        blocks indefinitely rather than waking several times a second.
+        """
         if self.until <= 0:
-            return IDLE_TIMEOUT
+            return None
         now = time.time()
         return max(0.002, min(self.until, self.next_refresh) - now)
 
@@ -247,101 +234,141 @@ class FFHandler:
         self.ui = ui
         self.rumble = rumble
         self.effects = {}      # effect id -> (strong, weak, length_ms)
+        self.playing = set()   # effect ids the game currently has running
 
     def _upload(self, request_id):
-        buf = bytearray(SIZEOF_FF_UPLOAD)
-        struct.pack_into("<I", buf, 0, request_id)
         try:
-            fcntl.ioctl(self.ui.fd, UI_BEGIN_FF_UPLOAD, buf)
-        except OSError as exc:
-            log(f"ff: BEGIN_FF_UPLOAD failed: {exc}")
+            upload = self.ui.begin_upload(request_id)
+        except (OSError, UInputError) as exc:
+            log(f"ff: begin_upload failed: {exc}")
             return
-        # struct ff_effect starts at offset 8 within uinput_ff_upload
-        base = 8
-        etype, eid = struct.unpack_from("<Hh", buf, base)
-        length = struct.unpack_from("<H", buf, base + 10)[0]     # replay.length
-        strong, weak = struct.unpack_from("<HH", buf, base + 16)  # union: rumble
-        if etype == e.FF_RUMBLE:
-            self.effects[eid] = (strong, weak, length)
+        eff = upload.effect
+        length = eff.ff_replay.length
+        if eff.type == e.FF_RUMBLE:
+            rumble = eff.u.ff_rumble_effect
+            self.effects[eff.id] = (rumble.strong_magnitude,
+                                    rumble.weak_magnitude, length)
         else:
             # Approximate non-rumble effects so games still get something.
-            self.effects[eid] = (0x8000, 0x8000, length)
-        struct.pack_into("<i", buf, 4, 0)      # retval = success
+            self.effects[eff.id] = (0x8000, 0x8000, length)
+        upload.retval = 0
         try:
-            fcntl.ioctl(self.ui.fd, UI_END_FF_UPLOAD, buf)
-        except OSError as exc:
-            log(f"ff: END_FF_UPLOAD failed: {exc}")
+            self.ui.end_upload(upload)
+        except (OSError, UInputError) as exc:
+            log(f"ff: end_upload failed: {exc}")
 
     def _erase(self, request_id):
-        buf = bytearray(SIZEOF_FF_ERASE)
-        struct.pack_into("<I", buf, 0, request_id)
         try:
-            fcntl.ioctl(self.ui.fd, UI_BEGIN_FF_ERASE, buf)
-        except OSError as exc:
-            log(f"ff: BEGIN_FF_ERASE failed: {exc}")
+            erase = self.ui.begin_erase(request_id)
+        except (OSError, UInputError) as exc:
+            log(f"ff: begin_erase failed: {exc}")
             return
-        eid = struct.unpack_from("<I", buf, 8)[0]
-        self.effects.pop(eid, None)
-        struct.pack_into("<i", buf, 4, 0)
+        self.effects.pop(erase.effect_id, None)
+        self.playing.discard(erase.effect_id)
+        erase.retval = 0
         try:
-            fcntl.ioctl(self.ui.fd, UI_END_FF_ERASE, buf)
-        except OSError as exc:
-            log(f"ff: END_FF_ERASE failed: {exc}")
+            self.ui.end_erase(erase)
+        except (OSError, UInputError) as exc:
+            log(f"ff: end_erase failed: {exc}")
+        self._refresh()
+
+    def _refresh(self):
+        """Drive the motors from whichever effects are currently playing.
+
+        Games routinely run more than one effect at once (a sustained rumble
+        plus short impact pulses). Stopping any single effect must not silence
+        the others, so the strongest active magnitude wins rather than the most
+        recent event.
+        """
+        if not self.playing:
+            self.rumble.stop()
+            return
+        active = [self.effects.get(eid, (0xFFFF, 0xFFFF, 0))
+                  for eid in self.playing]
+        strong = max(s for s, _, _ in active)
+        weak = max(w for _, w, _ in active)
+        lengths = [ln for _, _, ln in active]
+        # 0 means "until stopped", so it dominates: if any active effect is
+        # open-ended the combined effect is too. Otherwise run until the
+        # longest one would have finished.
+        length = 0 if any(ln == 0 for ln in lengths) else max(lengths)
+        self.rumble.play(strong, weak, length)
 
     def pump(self):
         try:
-            data = os.read(self.ui.fd, EV_SIZE * 32)
-        except OSError as exc:
-            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                return
-            raise
-        for i in range(0, len(data) - EV_SIZE + 1, EV_SIZE):
-            _s, _us, etype, code, value = struct.unpack_from("llHHi", data, i)
-            if etype == e.EV_UINPUT:
-                if code == e.UI_FF_UPLOAD:
-                    self._upload(value)
-                elif code == e.UI_FF_ERASE:
-                    self._erase(value)
-            elif etype == e.EV_FF:
-                if code == e.FF_GAIN:
+            events = list(self.ui.read())
+        except BlockingIOError:
+            return
+        for ev in events:
+            if ev.type == e.EV_UINPUT:
+                if ev.code == e.UI_FF_UPLOAD:
+                    self._upload(ev.value)
+                elif ev.code == e.UI_FF_ERASE:
+                    self._erase(ev.value)
+            elif ev.type == e.EV_FF:
+                if ev.code == e.FF_GAIN:
                     # value is 0..0xFFFF; games use this as a master volume
-                    self.rumble.gain = max(0.0, min(1.0, value / 65535.0))
+                    self.rumble.gain = max(0.0, min(1.0, ev.value / 65535.0))
                     continue
-                if value:
-                    strong, weak, length = self.effects.get(code, (0xFFFF, 0xFFFF, 0))
-                    self.rumble.play(strong, weak, length)
+                if ev.value:
+                    self.playing.add(ev.code)
                 else:
-                    self.rumble.stop()
+                    self.playing.discard(ev.code)
+                self._refresh()
 
 
-def release_all(dst, held):
-    """Drop every held button and recentre the sticks.
+def create_pad():
+    """Publish the virtual Xbox 360 pad."""
+    dst = UInput(CAPS, name=DST_NAME, vendor=DST_VENDOR, product=DST_PRODUCT,
+                 version=DST_VERSION, bustype=e.BUS_USB, max_effects=16)
+    log(f"virtual pad created: {dst.device.path} ({DST_NAME}) with FF_RUMBLE")
+    return dst
 
-    Without this, a paddle held at the moment the controller disconnects stays
-    latched down on the virtual pad forever.
+
+def teardown(src, dst, held, rumble):
+    """Release the controller and destroy the virtual pad.
+
+    Destroying the pad (rather than leaving it published) is what makes games
+    see a real disconnect. It also means any buttons held at that moment vanish
+    with the device, so no explicit release is needed.
+
+    Returns the (src, dst, ff) triple as None so callers can reset their state
+    in the same statement, leaving no window where a SIGTERM-driven second
+    teardown could run against already-closed objects.
     """
-    changed = False
-    for code, n in list(held.items()):
-        if n > 0:
-            dst.write(e.EV_KEY, code, 0)
-            changed = True
     held.clear()
-    for code in (e.ABS_X, e.ABS_Y, e.ABS_RX, e.ABS_RY,
-                 e.ABS_Z, e.ABS_RZ, e.ABS_HAT0X, e.ABS_HAT0Y):
-        dst.write(e.EV_ABS, code, 0)
-        changed = True
-    if changed:
-        dst.syn()
+    rumble.close()
+    if src is not None:
+        for step in (src.ungrab, src.close):
+            try:
+                step()
+            except OSError as exc:
+                log(f"cleanup: {step.__name__} failed: {exc}")
+    if dst is not None:
+        try:
+            dst.close()
+            log("virtual pad removed")
+        except (OSError, UInputError) as exc:
+            log(f"cleanup: closing virtual pad failed: {exc}")
+    return None, None, None
 
 
 def main():
     log("8bitdo paddle shim starting")
-    dst = UInput(CAPS, name=DST_NAME, vendor=DST_VENDOR, product=DST_PRODUCT,
-                 version=DST_VERSION, bustype=e.BUS_USB, max_effects=16)
-    log(f"virtual pad created: {dst.device.path} ({DST_NAME}) with FF_RUMBLE")
+
+    # systemctl stop/restart sends SIGTERM, whose default disposition kills the
+    # interpreter outright. Without this the motors are never told to stop and
+    # the pad keeps buzzing for up to HOLD_MS after the service goes away.
+    def on_term(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, on_term)
 
     rumble = Rumble()
-    ff = FFHandler(dst, rumble)
+
+    # The virtual pad only exists while a real controller is connected, so
+    # games see genuine hotplug rather than a pad that is permanently present.
+    dst = None
+    ff = None
 
     # Track how many physical inputs hold each virtual button, so releasing a
     # paddle doesn't cancel a simultaneously-held stick click.
@@ -352,7 +379,6 @@ def main():
             if src is None:
                 src = find_source()
                 if src is None:
-                    rumble.close()
                     time.sleep(2)
                     continue
                 try:
@@ -365,20 +391,39 @@ def main():
                     continue
                 log(f"grabbed {src.path} ({src.name})")
                 held.clear()
+                # Publish the pad only now that a real controller is behind it.
+                try:
+                    dst = create_pad()
+                except OSError as exc:
+                    log(f"cannot create virtual pad: {exc}; retrying")
+                    src, dst, ff = teardown(src, None, held, rumble)
+                    time.sleep(2)
+                    continue
+                ff = FFHandler(dst, rumble)
                 rumble.open()
 
             try:
                 r, _, _ = select.select([src.fd, dst.fd], [], [], rumble.deadline())
-            except OSError:
-                r = []
+            except OSError as exc:
+                # A bad fd here would otherwise spin at 100% CPU with no output,
+                # since select() on a dead fd returns immediately. Drop the
+                # source and re-acquire rather than looping on it.
+                log(f"select failed: {exc}; dropping source")
+                src, dst, ff = teardown(src, dst, held, rumble)
+                time.sleep(1)
+                continue
 
             rumble.tick()
 
             if dst.fd in r:
                 try:
                     ff.pump()
-                except OSError as exc:
-                    log(f"ff pump error: {exc}")
+                except (OSError, UInputError) as exc:
+                    # A bad uinput fd stays permanently "readable", so logging
+                    # and carrying on would busy-loop. Rebuild instead.
+                    log(f"ff pump failed ({exc}); rebuilding virtual pad")
+                    src, dst, ff = teardown(src, dst, held, rumble)
+                    continue
 
             if src.fd not in r:
                 continue
@@ -386,20 +431,12 @@ def main():
             try:
                 events = list(src.read())
             except OSError as exc:
-                if exc.errno not in (errno.ENODEV, errno.EBADF):
-                    raise
-                log("source disconnected; waiting for it to return")
-                release_all(dst, held)
-                rumble.close()
-                try:
-                    src.ungrab()
-                except Exception:
-                    pass
-                try:
-                    src.close()
-                except Exception:
-                    pass
-                src = None
+                # Any I/O error means the pad is gone or the dongle is
+                # re-associating. Treat them all as "reconnect" - letting an
+                # unexpected errno escape would crash the daemon and can trip
+                # systemd's start-rate limit into leaving the unit failed.
+                log(f"source read failed ({exc}); waiting for it to return")
+                src, dst, ff = teardown(src, dst, held, rumble)
                 continue
 
             # Forward a whole batch, then emit one SYN_REPORT, mirroring the
@@ -441,8 +478,7 @@ def main():
     except KeyboardInterrupt:
         log("stopping")
     finally:
-        rumble.close()
-        dst.close()
+        teardown(src, dst, held, rumble)
     return 0
 
 
