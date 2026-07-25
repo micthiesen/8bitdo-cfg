@@ -18,7 +18,38 @@ PKT = 64
 
 REQ_WRITE = 1
 REQ_READ = 2
+REQ_REPORT_STATE = 7   # "enter config mode" - required before read/write
 REQ_COMMIT = 6
+
+
+def crc16_kermit(data):
+    """CRC-16/KERMIT as used by the 8BitDo config protocol.
+
+    Poly 0x8408 (reflected 0x1021), init 0xFFFF, no final XOR. This is the
+    variant also known as CRC-16/MCRF4XX; check value for "123456789" is 0x6F91.
+    """
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0x8408
+            else:
+                crc >>= 1
+    return crc & 0xFFFF
+
+
+def config_crc(cfg):
+    """CRC over the whole 1652-byte config with the CRC field itself zeroed."""
+    buf = bytearray(cfg)
+    struct.pack_into("<I", buf, OFF_CRC, 0)
+    return crc16_kermit(buf)
+
+
+def apply_config_crc(cfg):
+    buf = bytearray(cfg)
+    struct.pack_into("<I", buf, OFF_CRC, config_crc(buf))
+    return bytes(buf)
 
 ENABLED = 0x20190911
 
@@ -58,17 +89,34 @@ def func_name(val):
 
 
 def request(req_type, sub, data_len, offset, payload=b""):
-    """Build a 64-byte request packet."""
+    """Build a 64-byte request packet.
+
+    Bytes 9-10 carry a CRC-16/KERMIT over this packet's data payload. Writing
+    zero there (as an earlier version of this tool did) makes the firmware
+    silently discard the config.
+    """
     pkt = bytearray(PKT)
     pkt[0] = 0x81
     pkt[1] = data_len + 17
     pkt[2] = 0x04
     struct.pack_into("<HH", pkt, 3, req_type, sub)
-    struct.pack_into("<HH", pkt, 7, data_len, 0)  # size, checksum(0 for PID 3013)
-    struct.pack_into("<I", pkt, 11, CONFIG_SIZE if req_type != REQ_COMMIT else 0)
+    struct.pack_into("<H", pkt, 7, data_len)
+    struct.pack_into("<H", pkt, 9, crc16_kermit(payload) if payload else 0)
+    struct.pack_into("<I", pkt, 11, CONFIG_SIZE if req_type not in (REQ_COMMIT, REQ_REPORT_STATE) else 0)
     struct.pack_into("<I", pkt, 15, offset)
     pkt[19:19 + len(payload)] = payload
     return bytes(pkt)
+
+
+def enter_config_mode(fd):
+    """Send the report-state command. Some firmware ignores config without it."""
+    try:
+        exchange(fd, request(REQ_REPORT_STATE, 0, 0, 0), REQ_REPORT_STATE,
+                 timeout=1.0)
+    except TimeoutError:
+        # This model does not acknowledge it; the command still primes the
+        # device, so carry on rather than aborting.
+        pass
 
 
 def exchange(fd, pkt, want_type, timeout=3.0):
@@ -100,6 +148,7 @@ def exchange(fd, pkt, want_type, timeout=3.0):
 def read_config(path):
     fd = os.open(path, os.O_RDWR)
     try:
+        enter_config_mode(fd)
         out = bytearray()
         for offset in range(0, CONFIG_SIZE, CHUNK):
             size = min(CHUNK, CONFIG_SIZE - offset)
@@ -120,6 +169,7 @@ def write_config(path, cfg):
         raise ValueError(f"config must be {CONFIG_SIZE} bytes, got {len(cfg)}")
     fd = os.open(path, os.O_RDWR)
     try:
+        enter_config_mode(fd)
         for offset in range(0, CONFIG_SIZE, CHUNK):
             size = min(CHUNK, CONFIG_SIZE - offset)
             chunk = cfg[offset:offset + size]
@@ -183,7 +233,7 @@ def patch(cfg, profiles=(0,), slot=None, mode=None, overrides=None):
         struct.pack_into("<H", buf, OFF_SLOT, slot)
     if mode is not None:
         struct.pack_into("<H", buf, OFF_MODE, mode)
-    return bytes(buf)
+    return apply_config_crc(buf)
 
 
 def diff(a, b):
