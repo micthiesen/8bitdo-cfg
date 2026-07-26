@@ -143,11 +143,18 @@ class Rumble:
                 self._send(0, 0, 0)
             except OSError as exc:
                 log(f"rumble: stop on close failed: {exc}")
-            try:
-                os.close(self.fd)
-            except OSError:
-                pass
-            self.fd = None
+            # _send() itself closes and nils self.fd on ENODEV/EBADF/EIO (see
+            # below), so a dead device can already have zeroed it out from
+            # under us here. Re-check rather than assume the line above left
+            # it alone - os.close(None) raises TypeError, which the OSError
+            # handler below does not catch, and that used to escape close()
+            # (and teardown()) uncaught, crashing the daemon on disconnect.
+            if self.fd is not None:
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+                self.fd = None
         # Reset scheduling state too. Leaving `until`/`next_refresh` set would
         # keep deadline() short forever (waking the loop while the device is
         # gone) and would replay the stale motor values on reconnect.
@@ -337,18 +344,30 @@ def teardown(src, dst, held, rumble):
     teardown could run against already-closed objects.
     """
     held.clear()
-    rumble.close()
+    # Every step below releases a distinct resource (motors, the physical
+    # grab, the virtual pad) and gets its own try/except: teardown's whole
+    # job is to run to completion even when something is already broken, so
+    # one failure here must never skip the others. EVIOCGRAB (src.ungrab)
+    # and the uinput device (dst.close) are the two that matter most if
+    # skipped - a leaked grab makes the physical pad unusable until the
+    # service is restarted, and a leaked uinput device lingers as a phantom
+    # controller.
+    if rumble is not None:
+        try:
+            rumble.close()
+        except Exception as exc:  # noqa: BLE001 - must not abort the rest of teardown
+            log(f"cleanup: rumble.close failed: {exc}")
     if src is not None:
         for step in (src.ungrab, src.close):
             try:
                 step()
-            except OSError as exc:
+            except Exception as exc:  # noqa: BLE001 - same reasoning as above
                 log(f"cleanup: {step.__name__} failed: {exc}")
     if dst is not None:
         try:
             dst.close()
             log("virtual pad removed")
-        except (OSError, UInputError) as exc:
+        except Exception as exc:  # noqa: BLE001 - same reasoning as above
             log(f"cleanup: closing virtual pad failed: {exc}")
     return None, None, None
 
